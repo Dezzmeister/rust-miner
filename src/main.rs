@@ -1,6 +1,9 @@
 use sha2::{Sha256, Digest};
 use rand::prelude::*;
 use serde::Serialize;
+use cust::device::Device;
+use cust::error::{CudaResult, CudaError};
+use cust::context::Context;
 
 type Wallet = [u8; 16];
 
@@ -68,7 +71,18 @@ fn hash_full_block(full_block: &FullBlock) -> [u8; 32] {
     }
 }
 
-fn main() {
+fn cuda_device_setup() -> CudaResult<Context> {
+    let num_devices = Device::num_devices()?;
+    println!("Number of devices: {}", num_devices);
+
+    let device = Device::get_device(0)?;
+    println!("Device: {}", device.name()?);
+    println!("Total memory: {}", device.total_memory()?);
+
+    Context::new(device)
+}
+
+fn main() -> Result<(), CudaError> {
     let mut miner: Wallet = [0; 16];
     miner[0] = 69;
 
@@ -77,4 +91,17 @@ fn main() {
     let hash = hash_full_block(&guess);
 
     println!("{:x?}", hash);
+
+    // Cust code
+    match cust::init(cust::CudaFlags::empty()) {
+        Ok(_) => (),
+        Err(error) => panic!("{:?}", error)
+    }
+
+    let _ctx = match cuda_device_setup() {
+        Ok(context) => context,
+        Err(err) => return Err(err)
+    };
+
+    Ok(())
 }
