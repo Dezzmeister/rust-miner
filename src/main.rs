@@ -1,9 +1,8 @@
 use sha2::{Sha256, Digest};
 use rand::prelude::*;
 use serde::Serialize;
-use cust::device::Device;
-use cust::error::{CudaResult, CudaError};
-use cust::context::Context;
+use cust::prelude::*;
+use std::error::Error;
 
 type Wallet = [u8; 16];
 
@@ -29,6 +28,8 @@ struct FullBlock {
 
 const REWARD_SENDER: Wallet = [{0}; 16];
 const BLOCK_REWARD: f32 = 16.0;
+
+static MINER_PTX: &str = include_str!("../kernels/miner.ptx");
 
 impl Default for Transaction {
     fn default() -> Self {
@@ -71,18 +72,13 @@ fn hash_full_block(full_block: &FullBlock) -> [u8; 32] {
     }
 }
 
-fn cuda_device_setup() -> CudaResult<Context> {
-    let num_devices = Device::num_devices()?;
-    println!("Number of devices: {}", num_devices);
-
-    let device = Device::get_device(0)?;
-    println!("Device: {}", device.name()?);
-    println!("Total memory: {}", device.total_memory()?);
-
-    Context::new(device)
+fn fill_rand_slice(slice: &mut [f32]) {
+    for i in 0..slice.len() {
+        slice[i] = rand::random();
+    }
 }
 
-fn main() -> Result<(), CudaError> {
+fn main() -> Result<(), Box<dyn Error>> {
     let mut miner: Wallet = [0; 16];
     miner[0] = 69;
 
@@ -92,16 +88,63 @@ fn main() -> Result<(), CudaError> {
 
     println!("{:x?}", hash);
 
-    // Cust code
-    match cust::init(cust::CudaFlags::empty()) {
-        Ok(_) => (),
-        Err(error) => panic!("{:?}", error)
+    // ======= CUDA code =======
+
+    const SIZE: usize = 10000;
+
+    // CUDA API must be initialized and a device must be chosen to make a context
+    let _ctx = cust::quick_init()?;
+
+    // Load the compiled PTX code into a module
+    let module = Module::from_ptx(MINER_PTX, &[])?;
+    
+    // Create a stream to submit work to
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+    // Make some slices (on the host for now)
+    let mut x = [0.0f32; SIZE];
+    let mut y = [0.0f32; SIZE];
+    let mut out = [0.0f32; SIZE];
+
+    fill_rand_slice(&mut x);
+    fill_rand_slice(&mut y);
+
+    // Copy the slices to device memory
+    let x_gpu = x.as_slice().as_dbuf()?;
+    let y_gpu = y.as_slice().as_dbuf()?;
+    let out_gpu = out.as_slice().as_dbuf()?;
+
+    // Get the kernel so we can invoke it directly
+    let sum_func = module.get_function("add")?;
+
+    // Find an optimal launch config
+    let (_, block_size) = sum_func.suggested_launch_configuration(0, 0.into())?;
+    let grid_size = (SIZE as u32 + block_size - 1) / block_size;
+
+    println!("Using {} blocks and {} threads per block", grid_size, block_size);
+
+    unsafe {
+        // Launch the kernel. Slices need their lengths passed in after the device ptr
+        launch!(
+            sum_func<<<grid_size, block_size, 0, stream>>>(
+                x_gpu.as_device_ptr(),
+                x_gpu.len(),
+                y_gpu.as_device_ptr(),
+                y_gpu.len(),
+                out_gpu.as_device_ptr()
+            )
+        )?;
+
+        println!("after launch");
     }
 
-    let _ctx = match cuda_device_setup() {
-        Ok(context) => context,
-        Err(err) => return Err(err)
-    };
+    // Block until the work is complete
+    stream.synchronize()?;
+    
+    // Copy result data on device back to host
+    out_gpu.copy_to(&mut out)?;
+
+    println!("{} + {} = {}", x[0], y[0], out[0]);
 
     Ok(())
 }
