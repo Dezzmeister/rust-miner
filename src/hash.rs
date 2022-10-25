@@ -1,3 +1,5 @@
+use bincode::Error;
+
 use crate::FullBlock;
 
 const BYTES_PER_BLOCK: usize = 512 / 8;
@@ -228,6 +230,12 @@ pub fn start_hash(full_block: &FullBlock) -> (MessageSchedule, [u32; 8]) {
     copy_chunk_to_schedule(block, 5, &mut schedule);
 
     (schedule, hash)
+}
+
+pub fn hash_block(block: &FullBlock) -> Result<[u32; 8], Error> {
+    let bytes = bincode::serialize(&block)?;
+
+    Ok(hash_sha256(&bytes))
 }
 
 /**
