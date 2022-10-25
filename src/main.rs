@@ -2,8 +2,9 @@ pub mod hash;
 
 use rand::prelude::*;
 use serde::Serialize;
-use cust::prelude::*;
+use cust::{prelude::*, device::DeviceAttribute};
 use std::error::Error;
+use std::time::{Instant, Duration};
 
 use crate::hash::start_hash;
 
@@ -28,6 +29,16 @@ pub struct FullBlock {
     raw_block: RawBlock,
     rand_token: [u8; 16],
 } // 384 bytes
+
+pub struct Winner {
+    rand_token: [u8; 16],
+    hash: [u32; 8],
+}
+
+pub struct MiningResult {
+    winner: Winner,
+    tries: u64,
+}
 
 const REWARD_SENDER: Wallet = [0; 16];
 const BLOCK_REWARD: f32 = 16.0;
@@ -57,50 +68,166 @@ fn make_rand_block(winner: Wallet) -> RawBlock {
     RawBlock { data, id: 69, parent: 68 }
 }
 
+fn print_device_props(device: &Device) -> Result<(), Box<dyn Error>> {
+    let max_block_dim = (
+        device.get_attribute(DeviceAttribute::MaxBlockDimX)?,
+        device.get_attribute(DeviceAttribute::MaxBlockDimX)?,
+        device.get_attribute(DeviceAttribute::MaxBlockDimX)?
+    );
+
+    let max_grid_dim = (
+        device.get_attribute(DeviceAttribute::MaxGridDimX)?,
+        device.get_attribute(DeviceAttribute::MaxGridDimX)?,
+        device.get_attribute(DeviceAttribute::MaxGridDimX)?
+    );
+    
+    println!("Device Name: {}", device.name()?);
+    println!("Max threads per block: {}", device.get_attribute(DeviceAttribute::MaxThreadsPerBlock)?);
+    println!("Max block dim (x, y, z): {:#?}", max_block_dim);
+    println!("Max grid dim (x, y, z): {:#?}", max_grid_dim);
+
+    Ok(())
+}
+
+fn make_rand_guesses(num_guesses: usize) -> Vec<u8> {
+    let mut out = vec![0 as u8; num_guesses * 16];
+    
+    for i in 0..(num_guesses * 16) {
+        out[i] = rand::random();
+    }
+
+    out
+}
+
+/// Compare two numbers represented as arrays of orderable "digits".
+/// Each element of the arrays can be treated as a separate digit.
+/// The most significant digits are first. We also assume that
+/// a and b have the same size because this function needs to run
+/// as quickly as possible.
+fn less_than(a: &[u32; 8], b: &[u32; 8]) -> bool {
+    for i in 0..a.len() {
+        if a[i] == b[i] {
+            continue;
+        }
+
+        return a[i] < b[i]
+    }
+
+    false
+}
+
+fn find_winner(rand_tokens: &[u8], hashes: &[u32], max_hash: &[u32; 8]) -> Option<Winner> {
+    for i in (0..hashes.len()).step_by(8) {
+        let mut hash = [0 as u32; 8];
+        hash.copy_from_slice(&hashes[i..(i + 8)]);
+
+        if less_than(&hash, &max_hash) {
+            let token_index = i * 2;
+            let mut rand_token = [0 as u8; 16];
+            rand_token.copy_from_slice(&rand_tokens[token_index..(token_index + 16)]);
+
+            return Some(Winner { rand_token, hash });
+        }
+    }
+
+    None
+}
+
+fn mine_block(block: FullBlock, winning_hash: [u32; 8]) -> MiningResult {
+    #![allow(unused_mut)]
+
+    let _ctx = cust::quick_init().expect("Failed to create CUDA context");
+
+    let device = Device::get_device(0).expect("Failed to get CUDA device");
+    print_device_props(&device).expect("Failed to print info about CUDA device");
+
+    let module = Module::from_ptx(MINER_PTX, &[]).expect("Failed to load hashing module");
+    let kernel = module.get_function("finish_hash").expect("Failed to load hashing kernel");
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None).expect("Failed to create stream to submit work to device");
+
+    let (schedule, hash) = start_hash(&block);
+    let (grid_size, block_size) = kernel.suggested_launch_configuration(0, 0.into()).expect("Unable to determine launch config");
+    let num_guesses: usize = (grid_size * block_size).try_into().unwrap();
+
+    println!("Grid size: {}", grid_size);
+    println!("Block size: {}", block_size);
+    println!("Hashing {} guesses at a time", num_guesses);
+
+    let mut out: Option<Winner> = None;
+    let mut tries: u64 = 0;
+    let mut num_hashes: u64 = 0;
+    let mut start = Instant::now();
+
+    while out.is_none() {
+        let guesses = make_rand_guesses(num_guesses);
+        let mut hashes = vec![0 as u32; num_guesses * 8];
+
+        let rand_tokens_gpu = DeviceBuffer::from_slice(&guesses).expect("Failed to create device memory for random tokens");
+        let schedule_gpu = DeviceBuffer::from_slice(&schedule[0..12]).expect("Failed to create device memory for schedule");
+        let hash_vars_gpu = DeviceBuffer::from_slice(&hash).expect("Failed to create device memory for hash variables");
+        let mut hashes_gpu = DeviceBuffer::from_slice(hashes.as_slice()).expect("Failed to create device memory for hashes");
+
+        unsafe {
+            launch!(
+                kernel<<<grid_size, block_size, 0, stream>>>(
+                    rand_tokens_gpu.as_device_ptr(),
+                    rand_tokens_gpu.len(),
+                    schedule_gpu.as_device_ptr(),
+                    hash_vars_gpu.as_device_ptr(),
+                    hashes_gpu.as_device_ptr()
+                )
+            ).expect("Failed to launch hashing kernel");
+        }
+
+        let mut hashes_out = vec![0 as u32; num_guesses * 8];
+        stream.synchronize().expect("Failed to synchronize device stream");
+
+        hashes_gpu.copy_to(&mut hashes_out).expect("Failed to copy hashes from device back to host");
+        out = find_winner(&guesses, &hashes_out, &winning_hash);
+
+        tries = tries + 1;
+        num_hashes = num_hashes + (hashes_gpu.len() as u64);
+
+        if start.elapsed() > Duration::from_secs(5) {
+            let time_elapsed = start.elapsed().as_millis();
+            let hashes_per_millis = (num_hashes as u128) / time_elapsed;
+
+            println!("Hashes per second: {}", hashes_per_millis * 1000);
+
+            start = Instant::now();
+            num_hashes = 0;
+        }
+    }
+
+    MiningResult { winner: out.unwrap(), tries }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     #![allow(unused_mut)]
 
     let mut miner: Wallet = [0; 16];
     miner[0] = 69;
 
-    let rand_tokens: [u8; 16] = rand::random();
-    let guess = FullBlock { raw_block: make_rand_block(miner), rand_token: rand_tokens };
+    let block = FullBlock { raw_block: make_rand_block(miner), rand_token: [0 as u8; 16] };
 
-    let bytes = bincode::serialize(&guess)?;
-    let cpu_hash = hash::hash_sha256(bytes.as_slice());
+    let winning_hash: [u32; 8] = [
+        0x000000FF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+    ];
+    
+    let handle = std::thread::spawn(move || {
+        mine_block(block, winning_hash)
+    });
 
-    let (schedule, hash) = start_hash(&guess);
-
-    let _ctx = cust::quick_init();
-    let module = Module::from_ptx(MINER_PTX, &[])?;
-    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;    
-
-    let rand_tokens_gpu = DeviceBuffer::from_slice(&rand_tokens)?;
-    let schedule_gpu = DeviceBuffer::from_slice(&schedule[0..12])?;
-    let hash_vars_gpu = DeviceBuffer::from_slice(&hash)?;
-    let mut hashes_gpu = DeviceBuffer::from_slice(&[0 as u32; 8])?;
-
-    let hash_kernel = module.get_function("finish_hash")?;
-
-    unsafe {
-        launch!(
-            hash_kernel<<<1, 1, 0, stream>>>(
-                rand_tokens_gpu.as_device_ptr(),
-                rand_tokens_gpu.len(),
-                schedule_gpu.as_device_ptr(),
-                hash_vars_gpu.as_device_ptr(),
-                hashes_gpu.as_device_ptr()
-            )
-        )?;
-    }
-
-    let mut gpu_hash = [0 as u32; 8];
-    stream.synchronize()?;
-
-    hashes_gpu.copy_to(&mut gpu_hash)?;
-
-    println!("CPU hash: {:x?}", cpu_hash);
-    println!("GPU hash: {:x?}", gpu_hash);
+    let MiningResult{winner, tries} = handle.join().expect("Failed to load mining result");
+    println!("Won the block in {} tries with random guess {:x?}", tries, winner.rand_token);
+    println!("Block hash: {:x?}", winner.hash);
 
     Ok(())
 }
